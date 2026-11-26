@@ -1,0 +1,260 @@
+name: Build Chinese SideStore with iloader keychain compatibility
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sidestore-chinese-signfix-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build an iloader keychain compatibility candidate
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      UPSTREAM_COMMIT: 6032424a0e56c1c319762e786099bdd9186a238b
+      SIDESIGN_COMMIT: a731c0d5a9a6617c7b385ae493e07ffb7f81cd5d
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      BUILD_CONFIG: Release
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out Chinese build recipe
+        uses: actions/checkout@v4
+        with:
+          path: recipe
+          persist-credentials: false
+
+      - name: Check out the matching official SideStore source
+        uses: actions/checkout@v4
+        with:
+          repository: SideStore/SideStore
+          ref: 6032424a0e56c1c319762e786099bdd9186a238b
+          path: SideStore
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Select Xcode used by the official alpha build
+        id: official-xcode
+        continue-on-error: true
+        uses: maxim-lobanov/setup-xcode@v1.6.0
+        with:
+          xcode-version: '26.2'
+
+      - name: Use the current stable Xcode if the runner retired Xcode 26.2
+        if: steps.official-xcode.outcome == 'failure'
+        uses: maxim-lobanov/setup-xcode@v1.6.0
+        with:
+          xcode-version: latest-stable
+
+      - name: Apply the existing Chinese translation
+        run: |
+          test "$(git -C SideStore rev-parse HEAD)" = "$UPSTREAM_COMMIT"
+          test -s recipe/localization.patch
+          git -C SideStore apply --check ../recipe/localization.patch
+          git -C SideStore apply ../recipe/localization.patch
+          git -C SideStore diff --check
+          mkdir -p artifacts
+
+      - name: Preserve profile keychain groups when the app has none
+        run: |
+          test "$(git -C SideStore/Dependencies/SideSign rev-parse HEAD)" = "$SIDESIGN_COMMIT"
+          test -z "$(git -C SideStore/Dependencies/SideSign status --porcelain)"
+          python3 - <<'PY'
+          from pathlib import Path
+          target = Path("SideStore/Dependencies/SideSign/Sources/CodeSigning/CodeSignerAPI.swift")
+          source = target.read_bytes()
+          old = (b'                } else if key != "application-identifier"               &&\n'
+                 b'                          key != "com.apple.developer.team-identifier"  &&\n'
+                 b'                          key != "get-task-allow" \n')
+          new = (b'                } else if key != "application-identifier"               &&\n'
+                 b'                          key != "com.apple.developer.team-identifier"  &&\n'
+                 b'                          key != "get-task-allow"                      &&\n'
+                 b'                          key != "keychain-access-groups"\n')
+          if source.count(old) != 1:
+              raise SystemExit("Pinned SideSign source differs: refusing to patch")
+          target.write_bytes(source.replace(old, new, 1))
+          PY
+          git -C SideStore/Dependencies/SideSign diff --check
+          test "$(git -C SideStore/Dependencies/SideSign diff --name-only)" = 'Sources/CodeSigning/CodeSignerAPI.swift'
+          git -C SideStore/Dependencies/SideSign diff -- Sources/CodeSigning/CodeSignerAPI.swift > artifacts/keychain-compatibility.patch
+          test -s artifacts/keychain-compatibility.patch
+
+      - name: Run Swift regression checks against the actual entitlement filter
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+          source = Path("SideStore/Dependencies/SideSign/Sources/CodeSigning/CodeSignerAPI.swift").read_text()
+          start = "            var filteredEntitlements = matchedProfile.entitlements\n"
+          end = "            let plist = try PropertyListSerialization.data(\n"
+          if source.count(start) != 1 or source.count(end) != 1:
+              raise SystemExit("Cannot identify the actual entitlement filter")
+          begin = source.index(start)
+          finish = source.index(end, begin)
+          actual_filter = textwrap.dedent(source[begin:finish])
+          prefix = r''' 
+          import Foundation
+          struct MatchedProfile {
+              let entitlements: [String: Any]
+              let teamIdentifier: String
+          }
+          struct App { let entitlements: [String: Any] }
+          enum SignerError: Error { case invalidApp(cause: String) }
+          func debugLog(_ message: String) {}
+          func verboseLog(_ message: String) {}
+          func filter(_ profile: [String: Any], _ entitlements: [String: Any]) throws -> [String: Any] {
+              let matchedProfile = MatchedProfile(entitlements: profile, teamIdentifier: "DEMO123456")
+              let app = App(entitlements: entitlements)
+          '''
+          suffix = r''' 
+              return filteredEntitlements
+          }
+          func check(_ condition: Bool, _ message: String) {
+              guard condition else {
+                  print("FAIL: " + message)
+                  exit(1)
+              }
+              print("PASS: " + message)
+          }
+          let keychain = "keychain-access-groups"
+          let base: [String: Any] = [
+              "application-identifier": "DEMO123456.example.app",
+              "com.apple.developer.team-identifier": "DEMO123456",
+              "get-task-allow": true
+          ]
+          var profile = base
+          let profileGroups = ["DEMO123456.*", "DEMO123456.example.shared"]
+          profile[keychain] = profileGroups
+          profile["com.apple.developer.associated-domains"] = ["applinks:example.invalid"]
+          profile["aps-environment"] = "development"
+          let emptyApp = try filter(profile, [:])
+          check(emptyApp[keychain] as? [String] == profileGroups,
+                "unsigned app retains profile groups, wildcard and array order")
+          check(emptyApp["application-identifier"] as? String == base["application-identifier"] as? String,
+                "application identifier survives when absent from app")
+          check(emptyApp["com.apple.developer.team-identifier"] as? String == "DEMO123456",
+                "team identifier survives when absent from app")
+          check(emptyApp["get-task-allow"] as? Bool == true,
+                "get-task-allow survives when absent from app")
+          check(emptyApp["aps-environment"] == nil && emptyApp["com.apple.developer.associated-domains"] == nil,
+                "other undeclared profile entitlements are removed")
+          let appWithoutGroups = try filter(profile, ["application-identifier": "OLDTEAM123.example.app"])
+          check(appWithoutGroups[keychain] as? [String] == profileGroups,
+                "app with entitlements but no keychain groups retains profile groups")
+          let remapped = try filter(profile, [keychain: ["OLDTEAM123.example.shared", "OLDTEAM123.example.second"]])
+          check(remapped[keychain] as? [String] == ["DEMO123456.example.shared", "DEMO123456.example.second"],
+                "declared app groups keep the existing team remap and array order")
+          let noProfileGroups = try filter(base, [keychain: ["OLDTEAM123.example.shared"]])
+          check(noProfileGroups[keychain] == nil,
+                "profile without groups does not acquire an entitlement")
+          let emptyGroups = try filter(profile, [keychain: [String]()])
+          check(emptyGroups[keychain] as? [String] == [],
+                "explicit empty app groups keep the existing behavior")
+          do {
+              _ = try filter(profile, [keychain: ["invalidWithoutDot"]])
+              check(false, "malformed declared groups must be rejected")
+          } catch SignerError.invalidApp {
+              print("PASS: malformed declared groups keep the existing rejection")
+          }
+          print("All actual SideSign entitlement filter regression checks passed.")
+          '''
+          Path("artifacts/keychain-regression-signfix.swift").write_text(
+              textwrap.dedent(prefix) + actual_filter + textwrap.dedent(suffix)
+          )
+          PY
+          swift artifacts/keychain-regression-signfix.swift 2>&1 | tee artifacts/keychain-regression-signfix.log
+
+      - name: Archive the compatibility candidate source and provenance
+        run: |
+          {
+            echo 'Unofficial Simplified Chinese SideStore 0.7.0 alpha: iloader keychain compatibility candidate'
+            echo 'Status: candidate, not device verified'
+            echo 'Scope: preserve provisioning-profile keychain-access-groups only when app omits them'
+            echo 'Swift regression checks execute the actual modified entitlement filter'
+            echo "SideSign commit: $SIDESIGN_COMMIT"
+            echo 'Upstream: https://github.com/SideStore/SideStore'
+            echo "Upstream commit: $UPSTREAM_COMMIT"
+            echo "Translation recipe commit: $GITHUB_SHA"
+            echo "Build run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            date -u '+Build time: %Y-%m-%dT%H:%M:%SZ'
+            xcodebuild -version
+            git -C SideStore submodule status --recursive
+            echo 'Install this IPA using SideStore/SideServer or another compatible signing tool.'
+            echo 'The IPA does not contain an Apple developer certificate or a provisioning profile.'
+          } > artifacts/BUILD-INFO-signfix.txt
+          git -C SideStore diff --stat > artifacts/TRANSLATION-CHANGES-signfix.txt
+          cp recipe/localization.patch artifacts/localization.patch
+          tar --exclude='.git' -czf artifacts/SideStore-0.7.0-zh-Hans-signfix-source.tar.gz SideStore recipe
+
+      - name: Upload the complete translated application source
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideStore-0.7.0-zh-Hans-signfix-source
+          path: |
+            artifacts/SideStore-0.7.0-zh-Hans-signfix-source.tar.gz
+            artifacts/localization.patch
+            artifacts/BUILD-INFO-signfix.txt
+            artifacts/keychain-compatibility.patch
+            artifacts/keychain-regression-signfix.swift
+            artifacts/keychain-regression-signfix.log
+            artifacts/TRANSLATION-CHANGES-signfix.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Install tools used by the official build
+        run: brew install ldid xcbeautify
+
+      - name: Build the iPhone archive
+        working-directory: SideStore
+        run: |
+          mkdir -p build/logs
+          NSUnbufferedIO=YES make -B build 2>&1 | tee build/logs/build-signfix.log | xcbeautify --renderer github-actions
+
+      - name: Preserve entitlements and package the IPA
+        working-directory: SideStore
+        run: |
+          make fakesign 2>&1 | tee -a build/logs/build-signfix.log
+          make ipa 2>&1 | tee -a build/logs/build-signfix.log
+          test -s SideStore.ipa
+          unzip -tq SideStore.ipa
+          test -s SideStore.xcarchive/Products/Applications/SideStore.app/SideBackup.ipa
+          ldid -e SideStore.xcarchive/Products/Applications/SideStore.app/SideStore > build/logs/SideStore-entitlements-signfix.plist
+          ldid -e SideStore.xcarchive/Products/Applications/SideStore.app/PlugIns/AltWidgetExtension.appex/AltWidgetExtension > build/logs/Widget-entitlements-signfix.plist
+          cp SideStore.ipa ../artifacts/SideStore-0.7.0-zh-Hans-signfix.ipa
+          (cd ../artifacts && shasum -a 256 SideStore-0.7.0-zh-Hans-signfix.ipa > SHA256SUMS-signfix.txt)
+
+      - name: Upload the Chinese iloader compatibility candidate IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideStore-0.7.0-zh-Hans-signfix-IPA
+          path: |
+            artifacts/SideStore-0.7.0-zh-Hans-signfix.ipa
+            artifacts/SHA256SUMS-signfix.txt
+            artifacts/BUILD-INFO-signfix.txt
+            artifacts/keychain-compatibility.patch
+            artifacts/keychain-regression-signfix.swift
+            artifacts/keychain-regression-signfix.log
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostics if the build succeeds or fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideStore-zh-Hans-signfix-build-logs
+          path: |
+            SideStore/build/logs/
+            artifacts/BUILD-INFO-signfix.txt
+            artifacts/keychain-compatibility.patch
+            artifacts/keychain-regression-signfix.swift
+            artifacts/keychain-regression-signfix.log
+          if-no-files-found: warn
+          retention-days: 14
