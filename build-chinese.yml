@@ -1,0 +1,134 @@
+name: Build SideStore in Simplified Chinese
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sidestore-chinese-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build a sideloadable Chinese IPA
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      UPSTREAM_COMMIT: 6032424a0e56c1c319762e786099bdd9186a238b
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      BUILD_CONFIG: Release
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out Chinese build recipe
+        uses: actions/checkout@v4
+        with:
+          path: recipe
+          persist-credentials: false
+
+      - name: Check out the matching official SideStore source
+        uses: actions/checkout@v4
+        with:
+          repository: SideStore/SideStore
+          ref: 6032424a0e56c1c319762e786099bdd9186a238b
+          path: SideStore
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Select Xcode used by the official alpha build
+        id: official-xcode
+        continue-on-error: true
+        uses: maxim-lobanov/setup-xcode@v1.6.0
+        with:
+          xcode-version: '26.2'
+
+      - name: Use the current stable Xcode if the runner retired Xcode 26.2
+        if: steps.official-xcode.outcome == 'failure'
+        uses: maxim-lobanov/setup-xcode@v1.6.0
+        with:
+          xcode-version: latest-stable
+
+      - name: Apply the Chinese translation and archive its source
+        run: |
+          test "$(git -C SideStore rev-parse HEAD)" = "$UPSTREAM_COMMIT"
+          test -s recipe/localization.patch
+          git -C SideStore apply --check ../recipe/localization.patch
+          git -C SideStore apply ../recipe/localization.patch
+          git -C SideStore diff --check
+          mkdir -p artifacts
+          {
+            echo 'Unofficial Simplified Chinese build of SideStore 0.7.0 alpha'
+            echo 'Upstream: https://github.com/SideStore/SideStore'
+            echo "Upstream commit: $UPSTREAM_COMMIT"
+            echo "Translation recipe commit: $GITHUB_SHA"
+            echo "Build run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            date -u '+Build time: %Y-%m-%dT%H:%M:%SZ'
+            xcodebuild -version
+            git -C SideStore submodule status --recursive
+            echo 'Install this IPA using SideStore/SideServer or another compatible signing tool.'
+            echo 'The IPA does not contain an Apple developer certificate or a provisioning profile.'
+          } > artifacts/BUILD-INFO.txt
+          git -C SideStore diff --stat > artifacts/TRANSLATION-CHANGES.txt
+          cp recipe/localization.patch artifacts/localization.patch
+          tar --exclude='.git' -czf artifacts/SideStore-0.7.0-zh-Hans-source.tar.gz SideStore recipe
+
+      - name: Upload the complete translated application source
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideStore-0.7.0-zh-Hans-source
+          path: |
+            artifacts/SideStore-0.7.0-zh-Hans-source.tar.gz
+            artifacts/localization.patch
+            artifacts/BUILD-INFO.txt
+            artifacts/TRANSLATION-CHANGES.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Install tools used by the official build
+        run: brew install ldid xcbeautify
+
+      - name: Build the iPhone archive
+        working-directory: SideStore
+        run: |
+          mkdir -p build/logs
+          NSUnbufferedIO=YES make -B build 2>&1 | tee build/logs/build.log | xcbeautify --renderer github-actions
+
+      - name: Preserve entitlements and package the IPA
+        working-directory: SideStore
+        run: |
+          make fakesign 2>&1 | tee -a build/logs/build.log
+          make ipa 2>&1 | tee -a build/logs/build.log
+          test -s SideStore.ipa
+          unzip -tq SideStore.ipa
+          test -s SideStore.xcarchive/Products/Applications/SideStore.app/SideBackup.ipa
+          ldid -e SideStore.xcarchive/Products/Applications/SideStore.app/SideStore > build/logs/SideStore-entitlements.plist
+          ldid -e SideStore.xcarchive/Products/Applications/SideStore.app/PlugIns/AltWidgetExtension.appex/AltWidgetExtension > build/logs/Widget-entitlements.plist
+          cp SideStore.ipa ../artifacts/SideStore-0.7.0-zh-Hans.ipa
+          (cd ../artifacts && shasum -a 256 SideStore-0.7.0-zh-Hans.ipa > SHA256SUMS.txt)
+
+      - name: Upload the Chinese IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideStore-0.7.0-zh-Hans-IPA
+          path: |
+            artifacts/SideStore-0.7.0-zh-Hans.ipa
+            artifacts/SHA256SUMS.txt
+            artifacts/BUILD-INFO.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostics if the build succeeds or fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideStore-zh-Hans-build-logs
+          path: |
+            SideStore/build/logs/
+            artifacts/BUILD-INFO.txt
+          if-no-files-found: warn
+          retention-days: 14
